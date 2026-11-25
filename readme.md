@@ -1,4 +1,4 @@
-# tmxh v1.2.6
+# tmxh - tmux helper
 
 ## English
 
@@ -17,10 +17,10 @@ tmxh is a command-line tool for running and tracking shell commands in tmux pane
 
 ### Documentation
 
-- [User guide](https://github.com/novarobot/tmxh/blob/v1.2.6/readme-EN.md)
-- [AI agent guide](https://github.com/novarobot/tmxh/blob/v1.2.6/tmux-agent-EN.md)
-- [Technical reference](https://github.com/novarobot/tmxh/blob/v1.2.6/tmux-project-EN.md)
-- [System prompt](https://github.com/novarobot/tmxh/blob/v1.2.6/tmxh-system-prompt-EN.md)
+- [User guide](./readme-EN.md)
+- [AI agent guide](./tmux-agent-EN.md)
+- [Technical reference](./tmux-project-EN.md)
+- [System prompt](./tmxh-system-prompt-EN.md)
 
 ### Build Debian package
 
@@ -45,10 +45,10 @@ A tmxh egy parancssori eszköz shellparancsok futtatására és követésére tm
 
 ### Dokumentáció
 
-- [Használati útmutató](https://github.com/novarobot/tmxh/blob/v1.2.6/readme-HU.md)
-- [AI-ügynök útmutató](https://github.com/novarobot/tmxh/blob/v1.2.6/tmux-agent-HU.md)
-- [Műszaki leírás](https://github.com/novarobot/tmxh/blob/v1.2.6/tmux-project-HU.md)
-- [System prompt](https://github.com/novarobot/tmxh/blob/v1.2.6/tmxh-system-prompt-HU.md)
+- [Használati útmutató](./readme-HU.md)
+- [AI-ügynök útmutató](./tmux-agent-HU.md)
+- [Műszaki leírás](./tmux-project-HU.md)
+- [System prompt](./tmxh-system-prompt-HU.md)
 
 ### Debian-csomag készítése
 
