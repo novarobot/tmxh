@@ -1,0 +1,10 @@
+Package: tmxh
+Version: 1.2.6
+Section: utils
+Priority: optional
+Architecture: all
+Depends: tmux, perl
+Maintainer: tmxh local packaging <tmxh@localhost>
+Description: Command runner for interactive tmux panes
+ Run commands in tmux, track jobs, and archive per-user sessions.
+ Includes English and Hungarian documentation and package build files.

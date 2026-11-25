@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+if [ "$1" = remove ]; then
+    exec "${DPKG_ROOT:-}/opt/ds/tools/tmxh/install.sh" -r
+fi

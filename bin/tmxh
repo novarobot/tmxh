@@ -1,0 +1,1937 @@
+#!/usr/bin/env perl
+# tmxh – Perl segéd interaktív tmux panelek vezérléséhez.
+# Blokkoló és aszinkron feladatokat futtat, naplózza a küldést és a panelkimenetet.
+# Használat: readme.md. Műszaki leírás: tmux-project.md. Önteszt: test-tmuxh.sh.
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptionsFromArray :config no_ignore_case bundling pass_through no_auto_abbrev);
+use POSIX qw(strftime);
+use Time::HiRes qw(time usleep);
+use File::Path qw(make_path);
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path);
+use IPC::Open3 qw(open3);
+use JSON::PP;
+use Encode qw(decode);
+use MIME::Base64 qw(encode_base64);
+use Digest::MD5 qw(md5_hex);
+use Fcntl qw(:flock);
+
+our $VERSION = '1.2.6';
+umask 0077;
+my $TMUX = $ENV{TMUXH_TMUX} || 'tmux';
+my $JSON = JSON::PP->new->canonical->ascii(1);
+our $INTR = 0;
+our %CFG;
+my %P;
+
+$SIG{PIPE} = 'IGNORE';
+select(STDOUT); $| = 1;
+select(STDERR); $| = 1;
+select(STDOUT);
+
+#-------------------------------------------------------------------------------
+# A konfigurációs fájl kulcs = érték sorokat fogad.
+# A parancssori kapcsolók felülírják a fájlban beállított értékeket.
+#-------------------------------------------------------------------------------
+sub cfg_defaults {
+    my ($owner, undef, undef, undef, undef, undef, undef, $home) = getpwuid($<);
+    $home //= $ENV{HOME} || '/tmp';
+    %CFG = (
+        owner      => $owner,
+        home       => $home,
+        session_name => $ENV{TMUXH_SESSION} || 'codex',
+        window     => $ENV{TMUXH_WINDOW},
+        pane       => $ENV{TMUXH_PANE},
+        state_dir  => $ENV{TMUXH_STATE_DIR} || "$home/tmux",
+        config     => $ENV{TMUXH_CONFIG} || "$home/tmux/config",
+        create     => undef,  # külön kérésre vagy az alapértelmezett csatlakozáskor
+        no_pipe    => 0,      # 1 = a pipe-pane naplózás kihagyása
+        cols       => 200,    # az új munkamenet szélessége
+        rows       => 50,
+        start_cwd  => $ENV{HOME} || '/tmp',
+        timeout    => 0,      # 0 esetén korlátlan várakozás
+        idle       => 0,      # 0 esetén a csend figyelmen kívül marad
+        poll       => 0.1,    # lekérdezési időköz másodpercben
+        chunk      => 2000,   # a send-keys darabmérete bájtban
+        max_log    => 20,     # MiB, a TX- és auditnapló forgatási határa
+        marker     => 'TMUXH',
+        expect_cmd => '',     # elvárt előtérparancs a bemenet küldéséhez
+        guard      => 3,      # panel-ellenőrzési időköz másodpercben, 0 esetén kikapcsolva
+        json       => 0,
+        verbose    => 0,
+        quiet      => 0,
+        propagate  => 1,      # a feladat kilépési kódjának továbbadása
+        check      => 1,      # figyelmeztetés folytatólagos shell-sornál
+    );
+}
+
+sub load_config_file {
+    my $f = $CFG{config};
+    return unless $f && -f $f;
+    my $d = slurp($f);
+    return unless defined $d;
+    for my $line (split /\n/, $d) {
+        next if $line =~ /^\s*(?:#|$)/;
+        next unless $line =~ /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/;
+        my ($k, $v) = (lc $1, $2);
+        $v =~ s/^["']//;
+        $v =~ s/["']$//;
+        $k = 'session_name' if $k eq 'session' || $k eq 'default_session';
+        $k = 'state_dir' if $k eq 'tmux_dir';
+        next unless exists $CFG{$k} && $k ne 'owner' && $k ne 'home';
+        if ($k =~ /\A(?:config|state_dir|session_name|start_cwd|marker|expect_cmd)\z/) {
+            $CFG{$k} = $v;
+            next;
+        }
+        if    ($v =~ /^(?:0|no|false|off)$/i) { $CFG{$k} = 0 }
+        elsif ($v =~ /^(?:1|yes|true|on)$/i)  { $CFG{$k} = 1 }
+        elsif ($v =~ /^-?\d+(?:\.\d+)?$/)     { $CFG{$k} = $v + 0 }
+        else                                  { $CFG{$k} = $v }
+    }
+}
+
+#-------------------------------------------------------------------------------
+# Általános segédfüggvények
+#-------------------------------------------------------------------------------
+sub ts {
+    my $t    = time();
+    my $frac = $t - int($t);
+    return strftime('%Y-%m-%d %H:%M:%S', localtime(int $t)) . sprintf('.%03d', int($frac * 1000 + 0.5));
+}
+sub err   { my ($m) = @_; return if $CFG{quiet}; print STDERR ($m =~ /\n\z/ ? $m : "$m\n") }
+sub dbg   { my ($m) = @_; return unless $CFG{verbose}; print STDERR "[tmxh] $m\n" }
+sub fail  { my ($m, $code) = @_; $code //= 2; print STDERR "[tmxh HIBA] $m\n"; exit $code }
+sub slurp { my ($p) = @_; open my $fh, '<', $p or return undef; binmode $fh; local $/; my $d = <$fh>; close $fh; return $d }
+sub spew  {
+    my ($p, $d) = @_;
+    my $t = "$p.tmp.$$";
+    open my $fh, '>', $t or fail("nem lehet irni: $t: $!");
+    binmode $fh;
+    print {$fh} $d or fail("Nem írható a fájl: $t: $!");
+    close $fh or fail("nem lehet zarani: $t: $!");
+    rename $t, $p or fail("nem lehet atnevezni: $t -> $p: $!");
+}
+sub fsize { my ($p) = @_; my @s = stat($p); return @s ? $s[7] : 0 }
+sub sq    { my ($s) = @_; $s = '' unless defined $s; $s =~ s/'/'"'"'/g; return "'$s'" }
+sub trim  { my ($s) = @_; $s = '' unless defined $s; $s =~ s/\A\s+//; $s =~ s/\s+\z//; return $s }
+sub oneline {
+    my ($s) = @_;
+    $s = '' unless defined $s;
+    $s =~ s/\n/\\n/g;
+    $s =~ s/\t/\\t/g;
+    $s =~ s/\r/\\r/g;
+    $s =~ s/\s+\z//;
+    return $s;
+}
+sub deansi {
+    my ($s) = @_;
+    return '' unless defined $s;
+    $s =~ s/\e\][^\x07\x1b]*(?:\x07|\e\\)//g;     # OSC
+    $s =~ s/\e[P^_][^\e]*\e\\//g;                 # DCS / PM / APC
+    $s =~ s/\e\[[0-9;:?<>!]*[ -\/]*[0-~]//g;      # CSI
+    $s =~ s/\e[()][0-9A-Za-z]//g;                 # karakterkészlet-választó
+    $s =~ s/\e[\@A-Z^_{}|#.]//g;                  # további kétbájtos vezérlők
+    $s =~ s/\r\n/\n/g;
+    $s =~ s/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]//g;  # vezérlőkarakterek (\n, \t marad)
+    return $s;
+}
+sub strip_ts   { my ($s) = @_; $s =~ s/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] //; return $s }
+sub clean_line { my ($l) = @_; return deansi(strip_ts($l)) }
+sub fmt_dur    { my ($s) = @_; return '-' unless defined $s; return sprintf('%.2fs', $s) }
+sub ts_fmt     { my ($t) = @_; return '-' unless defined $t; return strftime('%Y-%m-%d %H:%M:%S', localtime(int $t)) }
+
+#-------------------------------------------------------------------------------
+# tmux-hívás összevont szabványos kimenettel és hibakimenettel
+#-------------------------------------------------------------------------------
+sub tmux {
+    my @a = @_;
+    my ($i, $o);
+    my $pid = eval { open3($i, $o, $o, $TMUX, @a) };
+    fail("A tmux nem indítható el: $@", 4) if !$pid;
+    close $i if $i;
+    local $/;
+    my $out = <$o>;
+    close $o;
+    waitpid($pid, 0);
+    return ($? >> 8, defined $out ? $out : '');
+}
+sub tmux_alive { my ($rc)     = tmux('-V'); return $rc == 0 }
+sub tmux_ver   { my ($rc, $o) = tmux('-V'); chomp $o; return $o }
+
+#===============================================================================
+# Állapotkönyvtár és naplók
+#-------------------------------------------------------------------------------
+# A TX- és auditnapló munkamenetenként, az RX-napló panelindításonként készül.
+#===============================================================================
+sub init_paths {
+    my ($archive) = @_;
+    my $id = $CFG{session};
+    fail("Érvénytelen munkamenet-azonosító: $id.") unless valid_session($id);
+    my $base = $CFG{state_dir};
+    my $label = session_label($id, $CFG{owner});
+    $P{root} = $archive // registered_archive($base, $label, $id) // last_archive($base, $id) // "$base/archive/.missing/$id";
+    $P{rx}      = "$P{root}/rx.log";
+    $P{tx}      = "$P{root}/tx.log";
+    $P{audit}   = "$P{root}/audit.log";
+    $P{rxpid}   = "$P{root}/rx.pid";
+    $P{jobs}    = "$P{root}/jobs";
+    $P{meta}    = "$P{root}/meta.json";
+    $P{filter}  = "$P{root}/rxfilter.pl";
+    $P{counter} = "$P{root}/counter";
+}
+sub init_state { make_path($P{root}) unless -d $P{root}; make_path($P{jobs}) unless -d $P{jobs} }
+
+sub log_append {
+    my ($file, $text) = @_;
+    open my $fh, '>>', $file or fail("Nem nyitható meg a napló: $file: $!");
+    binmode $fh;
+    flock($fh, LOCK_EX) or fail("Nem zárolható a napló: $file: $!");
+    print {$fh} $text or fail("Nem írható a napló: $file: $!");
+    close $fh or fail("Nem zárható a napló: $file: $!");
+}
+sub log_audit { my ($t) = @_; log_append($P{audit}, '[' . ts() . "] $t\n") }
+sub log_tx {
+    my ($text, $note) = @_;
+    $text = '' unless defined $text;
+    my $head = '[' . ts() . '] TX ' . (defined $note && length $note ? "$note " : '') . 'len=' . length($text) . "\n";
+    $text .= "\n" unless $text =~ /\n\z/;
+    log_append($P{tx}, $head . $text);
+}
+
+#===============================================================================
+# tmux munkamenet, panel és kimeneti csatorna
+#===============================================================================
+sub session_id_alive { my ($rc) = tmux('has-session', '-t', '='.$_[0]); return $rc == 0 }
+sub session_exists { return session_id_alive($CFG{session}) }
+
+sub pane_format {
+    return '#{pane_id}|#{pane_index}|#{window_index}|#{window_active}|#{pane_active}'
+         . '|#{pane_current_command}|#{pane_pid}|#{pane_dead}|#{pane_pipe}'
+         . '|#{pane_width}x#{pane_height}|#{pane_current_path}';
+}
+
+sub list_panes {
+    my ($rc, $o) = defined $CFG{pane} && $CFG{pane} =~ /\A%\d+\z/ && $CFG{global_pane}
+        ? tmux('list-panes', '-a', '-F', '#{session_name}|' . pane_format())
+        : tmux('list-panes', '-s', '-t', '='.$CFG{session}, '-F', '#{session_name}|' . pane_format());
+    return () if $rc;
+    my @panes;
+    for my $line (split /\n/, $o) {
+        my ($session, $id, $index, $window, $window_active, $active, $cmd, $pid, $dead, $pipe, $size, $path)
+            = split /\|/, $line, 12;
+        push @panes, {
+            session => $session, pane_id => $id, pane_index => $index,
+            window_index => $window, window_active => $window_active, active => $active,
+            cmd => $cmd, pid => $pid, dead => $dead, pipe => $pipe, size => $size, path => $path,
+        };
+    }
+    return @panes;
+}
+
+sub resolve_pane {
+    my @panes = list_panes();
+    my $want = $CFG{pane};
+    my $window = $CFG{window};
+    @panes = grep { $_->{window_index} eq $window } @panes if defined $window && length $window;
+    my ($pane) = grep {
+        defined $want && $want =~ /^%/ ? $_->{pane_id} eq $want
+            : (defined $window && length $window || $_->{window_active})
+                && (defined $want && length $want ? $_->{pane_index} eq $want : $_->{active})
+    } @panes;
+    fail("Nem található a kért tmux panel.", 3) unless $pane;
+    $CFG{session} = $pane->{session} if $CFG{global_pane};
+    init_paths();
+    $CFG{pane_id} = $pane->{pane_id};
+    $CFG{pane_cmd} = $pane->{cmd};
+    $P{rx} = panel_rx_path($pane->{pane_id}, $pane->{pid});
+    $P{rxpid} = "$P{rx}.pid";
+    return $pane;
+}
+
+sub panel_rx_path {
+    my ($pane, $pid) = @_;
+    $pane =~ s/^%//;
+    return "$P{root}/panes/$pane-$pid/rx.log";
+}
+
+sub job_rx_path {
+    my ($job) = @_;
+    return $job->{pane_pid} ? panel_rx_path($job->{pane}, $job->{pane_pid}) : "$P{root}/rx.log";
+}
+
+sub pane_current_command_of {
+    my ($pane) = @_;
+    my ($rc, $o) = tmux('display-message', '-p', '-t', $pane, '#{?pane_dead,,#{pane_current_command}}');
+    return '' if $rc;
+    chomp $o;
+    return $o;
+}
+
+# A pipe-pane nyers bájtokat ad át. A szűrő sortörés előtt is kiírja őket.
+sub filter_source {
+    return <<'FILTER_PL';
+#!/usr/bin/env perl
+# A panel nyers kimeneti bájtjainak továbbítása az rx.log fájlba.
+use strict;
+use warnings;
+use Errno qw(EINTR);
+umask 0077;
+my ($log, $pidfile) = @ARGV;
+exit 1 unless defined $log;
+binmode STDIN;
+open(my $fh, '>>', $log) or exit 1;
+binmode $fh;
+select((select($fh), $| = 1)[0]);
+open(my $pf, '>', $pidfile) or exit 1;
+print {$pf} "$$\n";
+close $pf or exit 1;
+while (1) {
+    my $n = sysread(STDIN, my $chunk, 65536);
+    next if !defined $n && $! == EINTR;
+    exit 1 unless defined $n;
+    last unless $n;
+    print {$fh} $chunk or exit 1;
+}
+exit 0;
+FILTER_PL
+}
+
+# A PID-fájl és a folyamat parancssora együtt azonosítja a kimeneti szűrőt.
+sub pipe_pid_alive {
+    return 0 unless -f $P{rxpid};
+    my $p = slurp($P{rxpid});
+    return 0 unless defined $p;
+    $p =~ s/\s+//g;
+    return 0 unless $p =~ /^\d+$/;
+    return 0 unless kill(0, $p);
+    my $cl = slurp("/proc/$p/cmdline");
+    $cl = '' unless defined $cl;
+    return index($cl, $P{rx}) >= 0 ? ($p + 0) : 0;
+}
+sub stop_pipe { tmux('pipe-pane', '-t', $CFG{pane_id}) }
+
+sub ensure_pipe {
+    my ($pane) = @_;
+    open my $lock, '>>', "$P{root}/pipe.lock" or fail("Nem nyitható meg a naplózási zár: $!");
+    flock($lock, LOCK_EX) or fail("Nem zárolható a naplózás: $!");
+    my ($rc, $pipe) = tmux('display-message', '-p', '-t', $CFG{pane_id}, '#{pane_pipe}');
+    fail("A panel bezárult a naplózás indítása előtt.", 5) if $rc;
+    chomp $pipe;
+    return 1 if $pipe && pipe_pid_alive();
+    if ($pipe) {
+        my $legacy = slurp("$P{root}/rx.pid") // '';
+        my ($pid) = $legacy =~ /\A(\d+)\s*\z/;
+        my $command = defined $pid ? slurp("/proc/$pid/cmdline") // '' : '';
+        fail("A panelen már fut egy pipe-pane naplózó. Cél: $pane->{pane_id}.")
+            unless index($command, "$P{root}/rxfilter.pl") >= 0 && index($command, "$P{root}/rx.log") >= 0
+                && (slurp("$P{root}/meta.json") // '') =~ /"pane_id":"\Q$pane->{pane_id}\E"/;
+        stop_pipe();
+    }
+    make_path(dirname($P{rx}));
+    my $src = filter_source();
+    my $cur = slurp($P{filter});
+    spew($P{filter}, $src) unless defined $cur && $cur eq $src;
+    chmod 0755, $P{filter};
+    unlink $P{rxpid};
+    my $cmd = 'exec perl ' . join(' ', map { sq($_) } @P{qw(filter rx rxpid)});
+    $cmd =~ s/#/##/g;
+    $cmd =~ s/%/%%/g;
+    my ($start_rc, $msg) = tmux('pipe-pane', '-o', '-t', $CFG{pane_id}, $cmd);
+    fail("pipe-pane nem indithato a(z) $CFG{pane_id} panelen: " . trim($msg)) if $start_rc;
+    my $deadline = time + 3;
+    while (time < $deadline) { last if pipe_pid_alive(); usleep(50_000) }
+    my $ok = pipe_pid_alive();
+    dbg("rx filter pid=" . ($ok ? $ok : 'ISMERETLEN'));
+    fail("A panel kimeneti naplózása nem indult el.") unless $ok;
+    return $ok;
+}
+
+sub rotate_small_logs {
+    return unless $CFG{max_log};
+    for my $f ($P{tx}, $P{audit}) {
+        if (fsize($f) > $CFG{max_log} * 1024 * 1024) { rename $f, "$f.1"; dbg("log forogas: $f") }
+    }
+}
+
+sub last_screen_line {
+    my ($rc, $o) = tmux('capture-pane', '-p', '-t', $CFG{pane_id}, '-S', '-3');
+    return '' if $rc;
+    my @l = grep { /\S/ } split /\n/, $o;
+    return @l ? $l[-1] : '';
+}
+
+sub warn_if_unexpected {
+    my ($pane) = @_;
+    return if $CFG{quiet} || !$CFG{check};
+    if (length $CFG{expect_cmd} && $pane->{cmd} ne $CFG{expect_cmd}) {
+        err("[tmxh] FIGYELEM: a panel parancsa '$pane->{cmd}', a vart '$CFG{expect_cmd}' helyett - az SSH kapcsolat megszakadhatott!");
+    }
+    err("[tmxh] FIGYELEM: a shell folytatasos sorban van (PS2 >). Megoldas: tmxh interrupt")
+        if last_screen_line() =~ /^\s*>+\s*\z/;
+}
+
+sub check_input_pane {
+    my ($id) = @_;
+    my $current = pane_current_command_of($id);
+    fail("A tmux panel bezárult: $id.", 5) unless length $current;
+    if (length $CFG{expect_cmd} && $current ne $CFG{expect_cmd}) {
+        fail("A panel parancsa '$current', a várt '$CFG{expect_cmd}'. Ellenőrizd az SSH-kapcsolatot.", 5);
+    }
+}
+
+sub save_meta {
+    my ($pane, $pipe_ok) = @_;
+    spew($P{meta}, $JSON->encode({
+        session        => $CFG{session},
+        pane_id        => $pane->{pane_id},
+        pane_cmd       => $pane->{cmd},
+        pane_path      => $pane->{path},
+        pane_size      => $pane->{size},
+        pane_pid       => $pane->{pid},
+        state_dir      => $P{root},
+        rx_log         => $P{rx},
+        pipe_ok        => $pipe_ok ? 1 : 0,
+        helper_version => $VERSION,
+        tmux           => tmux_ver(),
+        updated        => ts(),
+    }) . "\n");
+}
+
+# Kiválasztja a panelt, ellenőrzi a célját, és előkészíti a naplókat.
+sub ensure_all {
+    my (%options) = @_;
+    fail("A tmux nem érhető el: $TMUX.", 4) unless tmux_alive();
+    if (!$CFG{global_pane} && !session_exists()) {
+        fail("Hiányzik az SSH célmunkamenet: $CFG{session}.", 5) if $options{input} && length $CFG{expect_cmd};
+        fail("Nincs '$CFG{session}' tmux munkamenet. Létrehozás: tmxh --create.", 3) unless $CFG{create};
+        my ($rc, $msg) = tmux('new-session', '-d', '-s', $CFG{session}, '-x', $CFG{cols}, '-y', $CFG{rows}, '-c', $CFG{start_cwd});
+        fail("nem hozhato letre a(z) '$CFG{session}' tmux munkamenet: " . trim($msg)) if $rc;
+        err("[tmxh] uj tmux munkamenet letrehozva: $CFG{session} (${CFG{cols}}x${CFG{rows}}, indito cwd: $CFG{start_cwd})");
+        $CFG{created} = 1;
+    }
+    my $pane = resolve_pane();
+    fail("A tmux panel bezárult: $pane->{pane_id}.", 5) if $pane->{dead};
+    check_input_pane($pane->{pane_id}) if $options{input};
+    init_paths(register_session());
+    $P{rx} = panel_rx_path($pane->{pane_id}, $pane->{pid});
+    $P{rxpid} = "$P{rx}.pid";
+    init_state();
+    rotate_small_logs();
+    my $pipe_ok = $CFG{no_pipe} ? 0 : ensure_pipe($pane);
+    save_meta($pane, $pipe_ok);
+    warn_if_unexpected($pane);
+    return $pane;
+}
+
+#===============================================================================
+# Bemenet küldése és kimenet olvasása
+#===============================================================================
+sub send_text {
+    my ($text, $note) = @_;
+    return unless defined $text && length $text;
+    my $cs   = ($CFG{chunk} && $CFG{chunk} > 0) ? $CFG{chunk} : 2000;
+    log_tx($text, $note);
+    my $rest = $text;
+    while (length $rest) {
+        my $c = substr($rest, 0, $cs, '');
+        check_input_pane($CFG{pane_id}) if length $CFG{expect_cmd};
+        my ($rc, $msg) = tmux('send-keys', '-t', $CFG{pane_id}, '-l', '--', $c);
+        fail("send-keys hiba: " . trim($msg)) if $rc;
+        usleep(10_000) if length $rest;
+    }
+    log_audit("SEND pane=$CFG{pane_id} text=" . oneline($text)) if $note eq 'send';
+}
+sub send_keys {
+    my (@keys) = @_;
+    check_input_pane($CFG{pane_id});
+    my ($rc, $msg) = tmux('send-keys', '-t', $CFG{pane_id}, @keys);
+    fail("send-keys hiba: " . trim($msg)) if $rc;
+    log_tx('<' . join(',', @keys) . '>', 'keys');
+    log_audit("KEYS pane=$CFG{pane_id} keys=" . oneline(join(' ', @keys)));
+}
+
+# A jelzők kereséséhez teljes sorokat olvas a megadott bájtpozíciótól.
+sub read_records {
+    my ($path, $pos) = @_;
+    my @recs;
+    $pos = 0 unless defined $pos && $pos > 0;
+    open my $fh, '<', $path or return \@recs;
+    binmode $fh;
+    seek($fh, $pos, 0) or do { close $fh; return \@recs };
+    my $off = $pos;
+    local $/ = "\n";
+    while (defined(my $l = <$fh>)) {
+        push @recs, { text => $l, start => $off, end => $off + length($l) };
+        $off += length($l);
+        last if ($off - $pos) > 16_000_000;
+    }
+    close $fh;
+    if (@recs && $recs[-1]{text} !~ /\n\z/) { $off = $recs[-1]{start}; pop @recs }
+    return \@recs;
+}
+
+sub read_range {
+    my ($path, $from, $to, $raw) = @_;
+    $from = 0 unless defined $from && $from > 0;
+    open my $fh, '<', $path or return '';
+    binmode $fh;
+    seek($fh, $from, 0) or do { close $fh; return '' };
+    my $data = '';
+    if (defined $to) {
+        my $need = $to - $from;
+        while (length($data) < $need) {
+            my $n = read($fh, my $chunk, $need - length($data));
+            last unless $n;
+            $data .= $chunk;
+        }
+    }
+    else {
+        local $/;
+        $data = <$fh>;
+        $data = '' unless defined $data;
+    }
+    close $fh;
+    return join('', map { $raw ? $_ : clean_line($_) } split /(?<=\n)/, $data);
+}
+
+#===============================================================================
+# Feladatok beküldése, követése és lekérdezése
+#-------------------------------------------------------------------------------
+# A shell külön kezdő- és zárójelzőt ír ki. A zárójelző tartalmazza a kilépési kódot.
+#===============================================================================
+sub next_job_id {
+    my $n = slurp($P{counter});
+    $n = 0 unless defined $n && $n =~ /^\d+$/;
+    $n++;
+    spew($P{counter}, "$n\n");
+    return "J$n";
+}
+sub job_file { my ($id) = @_; return "$P{jobs}/$id.json" }
+sub save_job { my ($j) = @_; spew(job_file($j->{id}), $JSON->encode($j) . "\n") }
+sub load_job {
+    my ($id) = @_;
+    return undef unless defined $id && $id =~ /^J\d+$/;
+    my $d = slurp(job_file($id));
+    return undef unless defined $d;
+    my $j = eval { $JSON->decode($d) };
+    return $j;
+}
+sub job_num { my ($id) = @_; return $id && $id =~ /(\d+)/ ? $1 + 0 : 0 }
+sub all_jobs {
+    opendir my $dh, $P{jobs} or return ();
+    my @ids = sort { job_num($a) <=> job_num($b) }
+              map  { my $x = $_; $x =~ s/\.json\z//; $x }
+              grep { /^J\d+\.json\z/ } readdir $dh;
+    closedir $dh;
+    return map { load_job($_) } @ids;
+}
+sub running_jobs { return grep { $_ && ($_->{status} // '') eq 'running' } all_jobs() }
+
+sub build_job_text {
+    my ($j) = @_;
+    my $M      = $CFG{marker};
+    my $cwd    = $j->{cwd};
+    my $cwd_on = (defined $cwd && length $cwd) ? 1 : 0;
+    my $wrap   = $j->{wrap} // 'raw';
+    my $cmd    = defined $j->{cmd} ? $j->{cmd} : '';
+    $cmd =~ s/\s+\z//;
+    my @cl = length($cmd) ? split(/\n/, $cmd, -1) : (':');
+    my @l  = ("printf '$j->{beg}\\n'");
+    for my $assignment (@{ $j->{env} || [] }) {
+        my ($key, $value) = split /=/, $assignment, 2;
+        push @l, "export $key=" . sq($value);
+    }
+    if ($wrap eq 'eval') {
+        my $d = "${M}_EOF_$j->{id}";
+        push @l, "TMUXH_C=\$(cat <<'$d'";
+        push @l, @cl;
+        push @l, $d, ')';
+        push @l, '( cd ' . sq($cwd) . ' || exit 9' if $cwd_on;
+        push @l, 'eval "$TMUXH_C"';
+        push @l, ')' if $cwd_on;
+    }
+    elsif ($cwd_on) {
+        push @l, '( cd ' . sq($cwd) . ' || exit 9';
+        push @l, @cl;
+        push @l, ')';
+    }
+    elsif ($wrap eq 'subshell') {
+        push @l, '(';
+        push @l, @cl;
+        push @l, ')';
+    }
+    else {
+        push @l, @cl;
+    }
+    push @l, "printf '\\n$j->{end}-%s\\n' \"\$?\"";
+    return join("\n", @l) . "\n";
+}
+
+sub send_job {
+    my ($cmd, %o) = @_;
+    fail("A run, bg és push parancshoz kimeneti naplózás szükséges.") if $CFG{no_pipe};
+    my $pane = ensure_all(input => 1);
+    send_keys('C-c') if $o{reset};
+    open my $lock, '>>', "$P{root}/submit.lock" or fail("Nem nyitható meg a küldési zár: $!");
+    flock($lock, LOCK_EX) or fail("Nem zárolható a küldés: $!");
+    my $id  = next_job_id();
+    my $M   = $CFG{marker};
+    my $off = fsize($P{rx});
+    my $j = {
+        id           => $id,
+        beg          => "${M}-BEG-$id",
+        end          => "${M}-END-$id",
+        cmd          => $cmd,
+        label        => (defined $o{label} && length $o{label}) ? $o{label} : $cmd,
+        cwd          => $o{cwd},
+        env          => $o{env},
+        wrap         => $o{wrap} // 'raw',
+        mode         => $o{mode} // 'block',
+        status       => 'running',
+        exit         => undef,
+        started      => time(),
+        started_ts   => ts(),
+        finished     => undef,
+        pane         => $CFG{pane_id},
+        pane_cmd     => ($CFG{pane_cmd} // ''),
+        pane_pid     => $pane->{pid},
+        pane_process => trim(slurp("/proc/$pane->{pid}/comm")),
+        expect_cmd   => $CFG{expect_cmd},
+        start_offset => $off,
+        scan_offset  => $off,
+        read_offset  => $off,
+        beg_offset   => undef,
+        end_offset   => undef,
+    };
+    my @run = grep { $_->{pane} eq $j->{pane} } running_jobs();
+    err('[tmxh] a panelen mar futo feladat: ' . join(',', map { $_->{id} } @run) . ' - az uj bemenet sorba all')
+        if @run && !$o{quiet_busy};
+    check_input_pane($j->{pane});
+    log_audit(sprintf('SUBMIT job=%s mode=%s pane=%s wrap=%s cmd=%s', $id, $j->{mode}, $CFG{pane_id},
+        $j->{wrap}, oneline($j->{label} // $cmd)));
+    send_text(build_job_text($j), "job=$id");
+    save_job($j);
+    return $j;
+}
+
+# A jelző körül a terminál sortörést vagy kocsivissza karaktert küldhet.
+sub marker_beg {
+    my ($clean, $beg) = @_;
+    return 0 unless defined $clean && defined $beg;
+    my $s = $clean;
+    $s =~ s/\r/\n/g;
+    for my $l (split /\n/, $s) {
+        $l =~ s/\A\s+//;
+        $l =~ s/\s+\z//;
+        return 1 if $l eq $beg;
+    }
+    return 0;
+}
+sub marker_exit {
+    my ($clean, $end) = @_;
+    return undef unless defined $clean && defined $end;
+    my $s = $clean;
+    $s =~ s/\r/\n/g;
+    for my $l (split /\n/, $s) {
+        $l =~ s/\A\s+//;
+        $l =~ s/\s+\z//;
+        return $1 + 0 if $l =~ /\A\Q$end\E-(\d+)\z/;
+    }
+    return undef;
+}
+
+# A panel és a várt előtérfolyamat ellenőrzése futó feladat közben.
+sub check_job_panel {
+    my ($j) = @_;
+    my $current = pane_current_command_of($j->{pane});
+    my $expected = $j->{expect_cmd} || ($j->{pane_cmd} eq 'ssh' ? 'ssh' : '');
+    my $original_process = $j->{pane_process} // '';
+    my $process = $j->{pane_pid} ? trim(slurp("/proc/$j->{pane_pid}/comm")) : $original_process;
+    return 1 if length $current && (!$expected || $current eq $expected)
+        && (!$original_process || $process eq $original_process);
+    $j->{status} = 'pane-cmd-changed';
+    $j->{pane_cmd_now} = $current;
+    $j->{end_offset} = fsize(job_rx_path($j));
+    $j->{finished} = time();
+    return 0;
+}
+
+sub job_exit_code {
+    my ($j) = @_;
+    return $j->{exit} if defined $j->{exit};
+    return 5 if $j->{status} eq 'pane-cmd-changed';
+    return 130 if $j->{status} eq 'interrupted';
+    return 124 if $j->{status} eq 'timeout' || $j->{status} eq 'idle';
+    return 1;
+}
+
+sub wait_job {
+    my ($j, %o) = @_;
+    my $pos       = defined $o{from} ? $o{from} : ($j->{scan_offset} // $j->{start_offset} // 0);
+    my $tout      = defined $o{timeout} ? $o{timeout} : $CFG{timeout};
+    my $idle      = defined $o{idle}    ? $o{idle}    : $CFG{idle};
+    my $print     = exists $o{print}    ? $o{print}   : 1;
+    my $deadline  = $tout ? time + $tout : 0;
+    my $last_data = time();
+    my $next_guard = $CFG{guard} ? time() + $CFG{guard} : 0;
+    my $rx = job_rx_path($j);
+    my $displayed = $pos;
+    local $INTR = 0;
+    local $SIG{INT} = sub { $INTR = 1 };
+    while (1) {
+        my $saved = load_job($j->{id});
+        if ($saved && $saved->{status} =~ /\A(?:interrupted|pane-cmd-changed)\z/) {
+            %$j = %$saved;
+            last;
+        }
+        my $visible_end = fsize($rx);
+        my $recs = read_records($rx, $pos);
+        if (@$recs) {
+            for my $r (@$recs) {
+                $pos = $r->{end};
+                my $c = clean_line($r->{text});
+                if (!$j->{beg_found} && marker_beg($c, $j->{beg})) { $j->{beg_found} = 1; $j->{beg_offset} = $r->{end} }
+                if ($j->{beg_found} && defined(my $x = marker_exit($c, $j->{end}))) {
+                    $j->{exit}       = $x;
+                    $j->{end_offset} = $r->{end};
+                    $j->{status}     = 'done';
+                    $j->{finished}   = time();
+                    last;
+                }
+            }
+            $j->{scan_offset} = $pos;
+            $last_data        = time();
+        }
+        $visible_end = $j->{end_offset} // $visible_end;
+        if ($visible_end > $displayed) {
+            print read_range($rx, $displayed, $visible_end) if $print;
+            $displayed = $visible_end;
+            $last_data = time();
+        }
+        last if $j->{status} ne 'running';
+        if ($next_guard && time() >= $next_guard) {
+            unless (check_job_panel($j)) {
+                err("[tmxh] A panel vagy az SSH-kapcsolat megszűnt vagy megváltozott. Feladat: $j->{id}.");
+                last;
+            }
+            $next_guard = time() + $CFG{guard};
+        }
+        if ($INTR) {
+            local $CFG{pane_id} = $j->{pane};
+            last unless check_job_panel($j);
+            send_keys('C-c');
+            $j->{status}   = 'interrupted';
+            $j->{finished} = time();
+            $j->{end_offset} = fsize($rx);
+            err('[tmxh] Ctrl-C: C-c kuldes a panelbe (a parancs altalaban megszakad)');
+            last;
+        }
+        if ($deadline && time() > $deadline) { $j->{status} = 'timeout'; last }
+        if ($idle && (time() - $last_data) > $idle) { $j->{status} = 'idle'; last }
+        usleep(($CFG{poll} || 0.1) * 1_000_000);
+    }
+    save_job($j);
+    return $j;
+}
+
+# Várakozás nélkül frissíti a feladatállapotot a már naplózott kimenetből.
+sub reap_job {
+    my ($j) = @_;
+    return $j if $j->{status} =~ /\A(?:done|interrupted|pane-cmd-changed)\z/;
+    my $pos  = $j->{scan_offset} // 0;
+    my $recs = read_records(job_rx_path($j), $pos);
+    for my $r (@$recs) {
+        $pos = $r->{end};
+        my $c = clean_line($r->{text});
+        if (!$j->{beg_found} && marker_beg($c, $j->{beg})) { $j->{beg_found} = 1; $j->{beg_offset} = $r->{end} }
+        if ($j->{beg_found} && defined(my $x = marker_exit($c, $j->{end}))) {
+            $j->{exit}       = $x;
+            $j->{end_offset} = $r->{end};
+            $j->{status}     = 'done';
+            $j->{finished}   = time();
+            last;
+        }
+    }
+    $j->{scan_offset} = $pos;
+    check_job_panel($j) if $CFG{guard} && $j->{status} eq 'running' && time() - $j->{started} >= $CFG{guard};
+    save_job($j);
+    return $j;
+}
+sub reap_all { my @j = all_jobs(); @j = map { reap_job($_) } @j; return @j }
+
+sub job_output {
+    my ($j, %o) = @_;
+    my $from = defined $o{from} ? $o{from} : ($j->{beg_offset} // $j->{start_offset} // 0);
+    my $to   = exists $o{to} ? $o{to} : $j->{end_offset};
+    return read_range(job_rx_path($j), $from, $to);
+}
+sub job_dur {
+    my ($j) = @_;
+    return undef unless defined $j->{started};
+    return ($j->{finished} // time()) - $j->{started};
+}
+
+#===============================================================================
+# Kapcsolók és közös segédfüggvények
+#===============================================================================
+sub set_target {
+    my ($t) = @_;
+    return unless defined $t && length $t;
+    if ($t =~ /\A%\d+\z/) { $CFG{pane} = $t; $CFG{global_pane} = 1; return }
+    my ($s, $w, $p) = ($t =~ /^([^:.]*)(?::([^:.]*))?(?:\.(.*))?$/);
+    fail("Érvénytelen tmux cél: $t") unless defined $s && length $s;
+    $CFG{global_pane} = 0;
+    if (index($s, "$CFG{owner}-") == 0) {
+        $CFG{explicit_id} = $s;
+        delete $CFG{explicit_name};
+    } else {
+        $CFG{explicit_name} = $s;
+        delete $CFG{explicit_id};
+    }
+    $CFG{window} = $w;
+    $CFG{pane} = $p;
+}
+
+sub common_opts {
+    return (
+    'target|t=s'   => sub { set_target($_[1]) },
+    'session-name|session|s=s' => sub { $CFG{explicit_name} = $_[1]; delete $CFG{explicit_id} },
+    'session-id|sessionid=s' => sub { $CFG{explicit_id} = $_[1]; delete $CFG{explicit_name} },
+    'user|u=s'     => \$CFG{user} ,
+    'pane|p=s'     => \$CFG{pane},
+    'window|w=s'   => \$CFG{window},
+    'state-dir=s'  => \$CFG{state_dir},
+    'config=s'     => \$CFG{config},
+    'create!'      => sub { $CFG{create} = $CFG{create_requested} = $_[1] },
+    'no-pipe'      => \$CFG{no_pipe},
+    'timeout=f'    => \$CFG{timeout},
+    'idle=f'       => \$CFG{idle},
+    'poll=f'       => \$CFG{poll},
+    'chunk=i'      => \$CFG{chunk},
+    'max-log=f'    => \$CFG{max_log},
+    'expect-cmd=s' => \$CFG{expect_cmd},
+    'check!'       => \$CFG{check},
+    'guard=f'      => \$CFG{guard},
+    'json'         => \$CFG{json},
+    'verbose|v+'   => \$CFG{verbose},
+    'quiet|q'      => \$CFG{quiet},
+    );
+}
+
+# Belső blokkoló futtatás, amely a hívónak adja vissza a kimenetet.
+sub run_blocking {
+    my ($cmd, %o) = @_;
+    my $j = send_job($cmd, mode => 'block', quiet_busy => 1, label => ($o{label} // $cmd));
+    wait_job($j, print => 0, (defined $o{timeout} ? (timeout => $o{timeout}) : ()));
+    return ($j, job_output($j));
+}
+
+# A POSIX shell „:” parancsával ellenőrzi a jelzők visszaérkezését.
+sub probe_shell {
+    my (%o) = @_;
+    my $t0 = time();
+    my ($j, $out) = run_blocking(':', timeout => ($o{timeout} // 10), label => 'probe');
+    my $rtt = time() - $t0;
+    unlink job_file($j->{id}) if $j->{id};
+    return ($j, $rtt, $out);
+}
+
+sub job_line {
+    my ($j, $full) = @_;
+    my $st  = $j->{status} // '?';
+    my $ex  = defined $j->{exit} ? $j->{exit} : '-';
+    my $cmd = oneline($j->{label} // $j->{cmd} // '');
+    $cmd = substr($cmd, 0, 96) . '...' if !$full && length($cmd) > 99;
+    return sprintf('%-5s %-17s exit=%-4s %9s  %-19s %s', $j->{id}, $st, $ex, fmt_dur(job_dur($j)), $j->{started_ts} // '', $cmd);
+}
+
+#-------------------------------------------------------------------------------
+# ensure / info / doctor
+#-------------------------------------------------------------------------------
+sub cmd_ensure {
+    my ($argv) = @_;
+    GetOptionsFromArray($argv, common_opts()) or fail("hasznalat: tmxh ensure [kapcsolok]", 2);
+    init_paths();
+    my $pane = ensure_all();
+    my %d = (
+        ok => 1, session => $CFG{session}, pane_id => $CFG{pane_id}, pane_cmd => $pane->{cmd},
+        pane_path => $pane->{path}, pane_size => $pane->{size}, created => ($CFG{created} ? 1 : 0),
+        pipe_ok => (pipe_pid_alive() ? 1 : 0), state_dir => $P{root},
+        rx_log => $P{rx}, tx_log => $P{tx}, audit_log => $P{audit},
+    );
+    if ($CFG{json}) { print $JSON->encode(\%d) . "\n" }
+    else {
+        printf "[tmxh] OK  munkamenet=%s  pane=%s  parancs=%s  cwd=%s  meret=%s  rx-filter=%s\n",
+            $d{session}, $d{pane_id}, $d{pane_cmd}, $d{pane_path}, $d{pane_size},
+            ($d{pipe_ok} ? 'ELO' : 'NINCS');
+    }
+    return 0;
+}
+
+sub cmd_info {
+    my ($argv) = @_;
+    GetOptionsFromArray($argv, common_opts()) or fail("hasznalat: tmxh info [kapcsolok]", 2);
+    init_paths();
+    my $pane = ensure_all();
+    my @jobs = grep { !$_->{probe} } all_jobs();
+    my @run  = grep { ($_->{status} // '') eq 'running' } @jobs;
+    my $ppid = pipe_pid_alive();
+    my %d = (
+        helper_version => $VERSION, tmux => tmux_ver(), session => $CFG{session},
+        pane_id => $CFG{pane_id}, pane_cmd => $pane->{cmd}, pane_path => $pane->{path},
+        pane_size => $pane->{size}, pane_pid => $pane->{pid}, pipe_ok => ($ppid ? 1 : 0),
+        pipe_pid => ($ppid || undef), state_dir => $P{root},
+        rx_log => $P{rx}, rx_bytes => fsize($P{rx}), tx_log => $P{tx}, tx_bytes => fsize($P{tx}),
+        audit_log => $P{audit}, jobs_total => scalar(@jobs), jobs_running => scalar(@run),
+        config_file => $CFG{config},
+    );
+    if ($CFG{json}) { print $JSON->encode(\%d) . "\n"; return 0 }
+    printf "tmxh %s (tmux: %s)\n", $VERSION, $d{tmux};
+    printf "  cel           : %s (panel %s, parancs: %s)\n", $CFG{session}, $d{pane_id}, $d{pane_cmd};
+    printf "  panel cwd     : %s\n", $d{pane_path};
+    printf "  meret         : %s\n", $d{pane_size};
+    printf "  allapotkonyvt. : %s\n", $d{state_dir};
+    printf "  rx.log        : %s (%d b, szuro: %s)\n", $d{rx_log}, $d{rx_bytes},
+        ($d{pipe_ok} ? "ELO (pid $d{pipe_pid})" : 'NINCS');
+    printf "  tx.log        : %s (%d b)\n", $d{tx_log}, $d{tx_bytes};
+    printf "  audit.log     : %s (%d b)\n", $d{audit_log}, fsize($P{audit});
+    printf "  feladatok     : %d osszesen, %d fut\n", $d{jobs_total}, $d{jobs_running};
+    return 0;
+}
+
+sub cmd_doctor {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'no-probe' => \$o{no_probe}, 'probe-timeout=f' => \$o{pt})
+        or fail("hasznalat: tmxh doctor [kapcsolok]", 2);
+    init_paths();
+    my @warn;
+    my %d = (helper_version => $VERSION, tmux_bin => $TMUX, session => $CFG{session});
+    if (!tmux_alive()) {
+        $d{tmux_ok} = 0;
+        push @warn, "a tmux ($TMUX) nem elerheto - nincs tmux server?";
+        print $CFG{json} ? $JSON->encode({ %d, warnings => \@warn }) . "\n" : "[tmxh] " . join('; ', @warn) . "\n";
+        return 4;
+    }
+    $d{tmux_ok} = 1;
+    $d{tmux}    = tmux_ver();
+    $d{session_exists} = ($CFG{global_pane} || session_exists()) ? 1 : 0;
+    if (!$d{session_exists}) {
+        push @warn, "nincs '$CFG{session}' tmux munkamenet (létrehozás: tmxh --create)";
+        $d{ok} = 0;
+        print $CFG{json} ? $JSON->encode({ %d, warnings => \@warn }) . "\n" : "[tmxh] " . join('; ', @warn) . "\n";
+        return 3;
+    }
+    my $pane = resolve_pane();
+    my $alive = pipe_pid_alive();
+    $d{pane_id}   = $pane->{pane_id};
+    $d{pane_cmd}  = $pane->{cmd};
+    $d{pane_path} = $pane->{path};
+    $d{pane_size} = $pane->{size};
+    $d{pipe_ok}   = $alive ? 1 : 0;
+    $d{pipe_pid}  = $alive || undef;
+    $d{rx_bytes}  = fsize($P{rx});
+    my @jobs = grep { !$_->{probe} } reap_all();
+    $d{jobs_total}   = scalar @jobs;
+    $d{jobs_running} = scalar grep { ($_->{status} // '') eq 'running' } @jobs;
+    push @warn, "a rx-filter (pipe-pane) nem fut: inditsd ujra (tmxh ensure)" unless $alive;
+    if (length $CFG{expect_cmd} && $pane->{cmd} ne $CFG{expect_cmd}) {
+        push @warn, "a panel parancsa '$pane->{cmd}' a vart '$CFG{expect_cmd}' helyett (SSH megszakt?!)";
+    }
+    push @warn, "a shell folytatasos sorban van (PS2 '>' )" if last_screen_line() =~ /^\s*>+\s*\z/;
+    push @warn, "futo feladat van: " . join(',', map { $_->{id} } grep { ($_->{status} // '') eq 'running' } @jobs)
+        if $d{jobs_running};
+    if (!$o{no_probe} && (!$CFG{expect_cmd} || $pane->{cmd} eq $CFG{expect_cmd}) && !$pane->{dead} && !$CFG{no_pipe}) {
+        my ($j, $rtt) = probe_shell(timeout => ($o{pt} // 10));
+        $d{probe_ok}  = (($j->{status} // '') eq 'done' && !$j->{exit}) ? 1 : 0;
+        $d{probe_rtt} = sprintf('%.0fms', $rtt * 1000);
+        push @warn, "a shell proba nem sikerult (statusz: " . ($j->{status} // '?') . ")" unless $d{probe_ok};
+    }
+    $d{ok}        = (@warn ? 0 : 1);
+    $d{warnings}  = \@warn;
+    if ($CFG{json}) { print $JSON->encode(\%d) . "\n"; return $d{ok} ? 0 : 1 }
+    printf "tmxh doctor (tmux %s)\n", $d{tmux};
+    printf "  munkamenet     : %s (letezik: %s)\n", $CFG{session}, ($d{session_exists} ? 'igen' : 'NEM');
+    printf "  panel          : %s  parancs=%s  cwd=%s  meret=%s\n", $d{pane_id}, $d{pane_cmd}, $d{pane_path}, $d{pane_size};
+    printf "  rx-filter      : %s\n", ($d{pipe_ok} ? "ELO (pid $d{pipe_pid})" : 'NINCS');
+    printf "  rx.log         : %d bajt\n", $d{rx_bytes};
+    printf "  feladatok      : %d ossz, %d fut\n", $d{jobs_total}, $d{jobs_running};
+    if (exists $d{probe_ok}) {
+        printf "  shell proba    : %s (%s)\n", ($d{probe_ok} ? 'OK' : 'HIBA'), $d{probe_rtt};
+    } else {
+        print "  shell proba    : kihagyva\n";
+    }
+    if (@warn) { print "  FIGYELEM:\n"; print "    - $_\n" for @warn; return 1 }
+    print "  => minden rendben\n";
+    return 0;
+}
+
+#-------------------------------------------------------------------------------
+# run / bg
+#-------------------------------------------------------------------------------
+sub cmd_run {
+    my ($argv, $force_nb) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(),
+        'no-block|n'  => sub { $o{block} = 0 },
+        'block'       => sub { $o{block} = 1 },
+        'cwd=s'       => \$o{cwd},
+        'env=s@'      => \$o{env},
+        'label=s'     => \$o{label},
+        'eval'        => sub { $o{wrap} = 'eval' },
+        'raw'         => sub { $o{wrap} = 'raw' },
+        'subshell'    => sub { $o{wrap} = 'subshell' },
+        'output|o=s'  => \$o{output},
+        'ignore-exit' => \$o{ignore_exit},
+        'reset'       => \$o{reset},
+    ) or fail(q{hasznalat: tmxh run [-n] [--timeout S] [--cwd DIR] [--env K=V] [--eval|--subshell] "parancs"}, 2);
+    init_paths();
+    $o{block} = 0 if $force_nb;
+    $o{block} = 1 unless defined $o{block};
+    my $cmd = join(' ', @$argv);
+    $cmd =~ s/\s+\z//;
+    fail("ures parancs", 2) unless length $cmd;
+    for my $assignment (@{ $o{env} || [] }) {
+        fail("Érvénytelen --env argumentum. A várt alak: K=V.", 2)
+            unless $assignment =~ /\A[A-Za-z_][A-Za-z0-9_]*=/;
+    }
+    my $j = send_job($cmd, mode => ($o{block} ? 'block' : 'nonblock'),
+        cwd => $o{cwd}, env => $o{env}, label => $o{label}, wrap => $o{wrap}, reset => $o{reset});
+    if (!$o{block}) {
+        if ($CFG{json}) {
+            print $JSON->encode({ ok => 1, job => $j->{id}, status => $j->{status}, pane => $CFG{pane_id},
+                cmd => decode('UTF-8', $cmd), rx_log => $P{rx} }) . "\n";
+        }
+        else {
+            print "$j->{id}\n";
+            err("[tmxh] $j->{id} elindult (nem blokkolo). Kerdezes: tmxh status $j->{id} | uj kimenet: tmxh read $j->{id} | varakozas: tmxh wait $j->{id}");
+        }
+        return 0;
+    }
+    my $t0    = time();
+    my $print = ($CFG{json} || $o{output}) ? 0 : 1;
+    wait_job($j, print => $print);
+    my $dur = time() - $t0;
+    my $out = ($CFG{json} || $o{output}) ? job_output($j) : '';
+    spew($o{output}, $out) if $o{output};
+    my $st = $j->{status} // '';
+    my $rc = job_exit_code($j);
+    log_audit(sprintf('DONE job=%s status=%s exit=%s dur=%.2fs cmd=%s', $j->{id}, $st,
+        (defined $j->{exit} ? $j->{exit} : '-'), $dur, oneline($j->{label} // $cmd)));
+    if ($CFG{json}) {
+        print $JSON->encode({ ok => ($st eq 'done' && !$j->{exit} ? 1 : 0), job => $j->{id}, status => $st,
+            exit => $j->{exit}, duration => sprintf('%.3f', $dur), output => decode('UTF-8', $out), cmd => decode('UTF-8', $cmd) }) . "\n";
+    }
+    else {
+        err(sprintf('[tmxh] %s: status=%s exit=%s idotartam=%.2fs', $j->{id}, $st,
+            (defined $j->{exit} ? $j->{exit} : '-'), $dur));
+    }
+    return ($CFG{propagate} && !$o{ignore_exit}) ? $rc : 0;
+}
+
+#-------------------------------------------------------------------------------
+# status / read
+#-------------------------------------------------------------------------------
+sub cmd_status {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(),
+        'running|r' => \$o{running}, 'all|a' => \$o{all}, 'long|l' => \$o{long}, 'limit=i' => \$o{limit})
+        or fail("hasznalat: tmxh status [JOB] [--running] [--all] [--json]", 2);
+    init_paths();
+    my $id = @$argv ? $argv->[0] : undef;
+    if (defined $id) {
+        my $j = load_job($id) or fail("nincs '$id' feladat (allapot: $P{jobs})", 3);
+        reap_job($j);
+        if ($CFG{json}) { print $JSON->encode($j) . "\n"; return 0 }
+        print job_line($j, 1) . "\n";
+        printf "  fajl         : %s\n", job_file($j->{id});
+        printf "  parancs      : %s\n", oneline($j->{cmd} // '');
+        printf "  offsetek     : start=%s beg=%s end=%s read=%s\n",
+            $j->{start_offset} // '-', $j->{beg_offset} // '-', $j->{end_offset} // '-', $j->{read_offset} // '-';
+        printf "  lezaras      : %s\n", ts_fmt($j->{finished});
+        printf "  panel parancs: %s -> %s\n", ($j->{pane_cmd} // '-'), ($j->{pane_cmd_now} // 'valtozatlan');
+        return 0;
+    }
+    my @jobs = grep { !$_->{probe} } reap_all();
+    my @run  = grep { ($_->{status} // '') eq 'running' } @jobs;
+    my @show = $o{running} ? @run : @jobs;
+    $o{limit} = 40 unless defined $o{limit};
+    @show = @show[(scalar(@show) - $o{limit}) .. -1] if @show > $o{limit};
+    if ($CFG{json}) {
+        print $JSON->encode({ session => $CFG{session}, pane => ($CFG{pane_id} // ''), busy => (@run ? 1 : 0),
+            running => [ map { $_->{id} } @run ], jobs => \@show }) . "\n";
+        return 0;
+    }
+    if (!@show) { print "nincs feladat (allapot: $P{jobs})\n"; return 0 }
+    printf "%-5s %-17s %-11s %9s  %-19s %s\n", 'JOB', 'STATUSZ', 'LEPES', 'IDOTART.', 'KEZDETS', 'PARANCS';
+    print job_line($_, $o{long}) . "\n" for @show;
+    printf "(%d feladat lathato, ebbol %d fut; osszesen %d)\n", scalar(@show), scalar(@run), scalar(@jobs);
+    return 0;
+}
+
+sub cmd_read {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'all' => \$o{all}, 'raw' => \$o{raw},
+        'tail=i' => \$o{tail}, 'no-advance' => \$o{noread})
+        or fail("hasznalat: tmxh read <JOB> [--all] [--tail N] [--raw]", 2);
+    init_paths();
+    my $id = shift @$argv;
+    fail("hasznalat: tmxh read <JOB>", 2) unless defined $id && length $id;
+    my $j = load_job($id) or fail("nincs '$id' feladat", 3);
+    reap_job($j);
+    my $rx = job_rx_path($j);
+    my $eof = fsize($rx);
+    my $to  = defined $j->{end_offset} ? $j->{end_offset} : $eof;
+    my $from = $o{all}
+        ? ($j->{beg_offset} // $j->{start_offset} // 0)
+        : ($j->{read_offset} // $j->{beg_offset} // $j->{start_offset} // 0);
+    $from = $j->{beg_offset} if defined $j->{beg_offset} && $from < $j->{beg_offset};
+    my $txt = defined $j->{beg_offset} ? read_range($rx, $from, $to, $o{raw}) : '';
+    $to = $j->{read_offset} unless defined $j->{beg_offset};
+    if ($o{tail}) {
+        my @l = split /\n/, $txt;
+        $txt = @l ? join("\n", @l[-($o{tail} < @l ? $o{tail} : scalar @l) .. -1]) . "\n" : '';
+    }
+    unless ($o{noread}) { $j->{read_offset} = $to; save_job($j) }
+    if ($CFG{json}) {
+        print $JSON->encode({ job => $j->{id}, status => $j->{status}, exit => $j->{exit},
+            new_bytes => length($txt), has_more => (($j->{status} // '') eq 'running') ? 1 : 0,
+            output => ($o{raw} ? $txt : decode('UTF-8', $txt)) }) . "\n";
+    }
+    else {
+        print $txt;
+        err(sprintf('[tmxh] %s: status=%s exit=%s%s', $j->{id}, $j->{status} // '?',
+            defined $j->{exit} ? $j->{exit} : '-', (($j->{status} // '') eq 'running' ? ' (meg fut)' : '')));
+    }
+    return 0;
+}
+
+#-------------------------------------------------------------------------------
+# wait / tail / idle
+#-------------------------------------------------------------------------------
+sub cmd_wait {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'all' => \$o{all}, 'print!' => \$o{print}, 'quiet-summary' => \$o{qs})
+        or fail("hasznalat: tmxh wait [JOB|--all] [--timeout S]", 2);
+    init_paths();
+    my $id = @$argv ? $argv->[0] : undef;
+    my @jobs;
+    if (defined $id) { my $j = load_job($id) or fail("nincs '$id' feladat", 3); @jobs = ($j) }
+    else {
+        @jobs = grep { ($_->{status} // '') eq 'running' } reap_all();
+        fail("nincs futo feladat (a tmxh status mindet listazza)", 0) unless @jobs || $CFG{json};
+    }
+    my $rc = 0;
+    for my $j (@jobs) {
+        $j->{status} = 'running' if $j->{status} =~ /\A(?:idle|timeout)\z/;
+        wait_job($j, print => (!$CFG{json} && (!defined $o{print} || $o{print})));
+        err(sprintf('[tmxh] %s: status=%s exit=%s idotartam=%s', $j->{id}, $j->{status} // '?',
+            defined $j->{exit} ? $j->{exit} : '-', fmt_dur(job_dur($j)))) if !$o{qs} && !$CFG{json};
+        my $x = job_exit_code($j);
+        $rc = $x if $x != 0;
+    }
+    print $JSON->encode({ jobs => [ map { { id => $_->{id}, status => $_->{status}, exit => $_->{exit} } } @jobs ] }) . "\n"
+        if $CFG{json};
+    return $CFG{propagate} ? $rc : 0;
+}
+
+sub cmd_tail {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'for=f' => \$o{for}, 'from-start' => \$o{start})
+        or fail("hasznalat: tmxh tail [--for S] [--from-start]", 2);
+    init_paths();
+    ensure_all();
+    $o{for} = 10 unless defined $o{for};
+    my $pos  = $o{start} ? 0 : fsize($P{rx});
+    my $stop = ($o{for} && $o{for} > 0) ? time + $o{for} : 0;
+    err('[tmxh] a rx.log kovetese: ' . (($o{for} && $o{for} > 0) ? sprintf('%.1f mp', $o{for}) : 'Ctrl-C-ig'))
+        unless $CFG{quiet};
+    local $SIG{INT} = sub { $stop = 1 };
+    while (1) {
+        my $end = fsize($P{rx});
+        if ($end > $pos) {
+            print read_range($P{rx}, $pos, $end);
+            $pos = $end;
+        }
+        last if $stop && ($stop == 1 ? 1 : time() > $stop);
+        usleep(($CFG{poll} || 0.1) * 1_000_000);
+    }
+    return 0;
+}
+
+sub cmd_idle {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'for=f' => \$o{for}, 'print!' => \$o{print})
+        or fail("hasznalat: tmxh idle [--for S] [--timeout S]", 2);
+    init_paths();
+    ensure_all();
+    $o{for}   = 1.0 unless defined $o{for};
+    $o{print} = 1   unless defined $o{print};
+    my $pos  = fsize($P{rx});
+    my $t0   = time();
+    my $last = time();
+    my $deadline = $CFG{timeout} ? time + $CFG{timeout} : 0;
+    while (1) {
+        my $end = fsize($P{rx});
+        if ($end > $pos) {
+            print read_range($P{rx}, $pos, $end) if $o{print} && !$CFG{json};
+            $pos = $end;
+            $last = time();
+        }
+        last if (time() - $last) >= $o{for};
+        if ($deadline && time() > $deadline) { err('[tmxh] idle timeout: a panel nem allt nyugalomba'); return 124 }
+        usleep(($CFG{poll} || 0.1) * 1_000_000);
+    }
+    print "[tmxh] a panel nyugalomban van (" . sprintf('%.1f', $o{for}) . " mp csend alapjan)\n"
+        unless $CFG{json} || $CFG{quiet};
+    print $JSON->encode({ idle => 1, waited => sprintf('%.2f', time() - $t0) }) . "\n" if $CFG{json};
+    return 0;
+}
+
+#-------------------------------------------------------------------------------
+# capture / send / keys / interrupt
+#-------------------------------------------------------------------------------
+sub cmd_capture {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'scrollback|S=i' => \$o{sb}, 'escape|e' => \$o{esc})
+        or fail("hasznalat: tmxh capture [-S N] [-e]", 2);
+    init_paths();
+    ensure_all();
+    $o{sb} = 200 unless defined $o{sb};
+    my @a = ('capture-pane', '-p', '-S', '-' . $o{sb}, '-t', $CFG{pane_id});
+    push @a, '-e' if $o{esc};
+    my ($rc, $out) = tmux(@a);
+    fail("capture-pane hiba: " . trim($out)) if $rc;
+    $out = deansi($out) unless $o{esc};
+    $out =~ s/(?:^[ \t]*\n)+\z//;
+    if ($CFG{json}) { print $JSON->encode({ pane => $CFG{pane_id}, content => decode('UTF-8', $out) }) . "\n" }
+    else { print $out . "\n" unless $out eq '' }
+    return 0;
+}
+
+sub cmd_send {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'enter|e' => \$o{enter}, 'raw' => \$o{raw})
+        or fail("hasznalat: tmxh send [--enter] \"szoveg\"", 2);
+    init_paths();
+    ensure_all(input => 1);
+    my $text = $o{raw} ? (defined $argv->[0] ? $argv->[0] : '') : join(' ', @$argv);
+    fail("ures szoveg", 2) unless length $text;
+    send_text($o{enter} ? "$text\n" : $text, 'send');
+    err('[tmxh] elkuldve' . ($o{enter} ? ' + Enter' : ' (Enter nelkul)') . ': ' . oneline($text)) unless $CFG{quiet};
+    return 0;
+}
+
+sub cmd_keys {
+    my ($argv) = @_;
+    GetOptionsFromArray($argv, common_opts()) or fail("hasznalat: tmxh keys C-c Enter ...", 2);
+    init_paths();
+    ensure_all(input => 1);
+    fail("nincs billentyue megadva (pl. C-c, Enter, C-u)", 2) unless @$argv;
+    send_keys(@$argv);
+    err('[tmxh] kuldes: <' . join(' ', @$argv) . '>') unless $CFG{quiet};
+    return 0;
+}
+
+sub cmd_interrupt {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'clear' => \$o{clear}, 'reap' => \$o{reap}, 'wait=f' => \$o{wait})
+        or fail("hasznalat: tmxh interrupt [--clear] [--reap] [--wait S]", 2);
+    init_paths();
+    ensure_all(input => 1);
+    send_keys('C-c');
+    send_keys('C-u') if $o{clear};
+    my $w = defined $o{wait} ? $o{wait} : (($o{reap} || $o{clear}) ? 1.0 : 0);
+    usleep($w * 1_000_000) if $w;
+    for my $j (reap_all()) {
+        next unless $j->{status} =~ /\A(?:running|timeout|idle)\z/ && $j->{pane} eq $CFG{pane_id};
+        $j->{status} = 'interrupted';
+        $j->{finished} = time();
+        $j->{end_offset} = fsize(job_rx_path($j));
+        save_job($j);
+    }
+    return 0;
+}
+
+#-------------------------------------------------------------------------------
+# Fájlmásolás Base64-kódolással a panelben futó shellen keresztül.
+#-------------------------------------------------------------------------------
+sub cmd_push {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'verify=s' => \$o{verify})
+        or fail("hasznalat: tmxh push <helyi fajl> [tavoli utvonal] [--verify size|md5|none]", 2);
+    init_paths();
+    my $local  = shift @$argv;
+    my $remote = shift @$argv;
+    fail("hasznalat: tmxh push <helyi fajl> [tavoli utvonal]", 2) unless defined $local && length $local;
+    fail("nincs ilyen helyi fajl: $local", 2) unless -f $local;
+    my $data = slurp($local);
+    fail("nem lehet elolvasni: $local: $!", 2) unless defined $data;
+    ensure_all(input => 1);
+    my $name = basename($local);
+    $remote = $name unless defined $remote && length $remote;
+    $remote = "./$remote" if $remote =~ /^-/;
+    my $dir = $remote =~ m{\A(.*)/[^/]+\z} ? ($1 || '/') : '.';
+    my $verify = $o{verify} // 'size';
+    fail("Ismeretlen ellenőrzési mód: $verify.") unless $verify =~ /\A(?:size|md5|none)\z/;
+    my $b64 = encode_base64($data);
+    $b64 =~ s/\s+\z//;
+    my $delim = $CFG{marker} . '_B64_' . int(rand(900_000) + 100_000);
+    my $heredoc = "mkdir -p " . sq($dir) . " && base64 -d > " . sq($remote) . " <<'$delim'\n$b64\n$delim";
+    my $tout = $CFG{timeout} ? $CFG{timeout} : (30 + int(length($b64) / 1500));
+    err(sprintf('[tmxh] push: %s (%d b) -> %s', $local, length($data), $remote)) unless $CFG{quiet};
+    my ($j, $out) = run_blocking($heredoc, timeout => $tout, label => "push $name -> $remote");
+    my $rc = defined $j->{exit} ? $j->{exit} : 1;
+    fail("a push nem futott le (statusz: " . ($j->{status} // '?') . "): " . substr(oneline($out), 0, 200), 1) if $rc;
+    my ($vok, $vinfo) = (1, 'skip');
+    if ($verify eq 'size') {
+        my ($verify_job, $o2) = run_blocking('wc -c < ' . sq($remote), timeout => 30);
+        my ($n) = $o2 =~ /^[ \t\r]*(\d+)[ \t\r]*$/m;
+        $vok   = (!job_exit_code($verify_job) && defined $n && $n == length($data)) ? 1 : 0;
+        $vinfo = sprintf('meret %s/%s b', ($n // '?'), length($data));
+    }
+    elsif ($verify eq 'md5') {
+        my ($verify_job, $o2) = run_blocking('md5sum < ' . sq($remote) . ' 2>/dev/null || md5 < ' . sq($remote), timeout => 30);
+        my ($m) = $o2 =~ /^[ \t\r]*([0-9a-f]{32})(?:[ \t]+-)?[ \t\r]*$/m;
+        $vok   = (!job_exit_code($verify_job) && defined $m && $m eq md5_hex($data)) ? 1 : 0;
+        $vinfo = sprintf('md5 %s (helyi: %s)', ($m // '?'), md5_hex($data));
+    }
+    if ($CFG{json}) {
+        print $JSON->encode({ ok => ($vok ? 1 : 0), local => $local, remote => $remote, bytes => length($data),
+            verify => $verify, verify_info => $vinfo, job => $j->{id} }) . "\n";
+    }
+    else {
+        err(sprintf('[tmxh] %s %s (%s)', ($vok ? 'OK:' : 'HIBA:'), $remote, $vinfo));
+    }
+    return $vok ? 0 : 1;
+}
+
+#-------------------------------------------------------------------------------
+# log / clean / kill / attach
+#-------------------------------------------------------------------------------
+sub cmd_log {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'lines|n=i' => \$o{n}, 'follow|f' => \$o{f}, 'path' => \$o{path})
+        or fail("hasznalat: tmxh log [audit|tx|rx] [-n N] [-f]", 2);
+    init_paths();
+    my $which = shift @$argv;
+    $which = 'audit' unless defined $which && length $which;
+    if ($which =~ /\A(?:rx|display|megjelent)\z/) {
+        if ($CFG{global_pane} || session_exists()) {
+            resolve_pane();
+        } else {
+            my $meta = eval { $JSON->decode(slurp($P{meta}) // '') };
+            $P{rx} = $meta->{rx_log} if $meta && $meta->{rx_log};
+        }
+    }
+    my $map = {
+        audit => $P{audit}, cmds => $P{audit}, cmd => $P{audit}, utasitas => $P{audit},
+        tx    => $P{tx},    sent => $P{tx},   kuldes => $P{tx},
+        rx    => $P{rx},    display => $P{rx}, megjelent => $P{rx},
+    };
+    my $file = $map->{$which} or fail("ismeretlen log: '$which' (audit|tx|rx)", 2);
+    if ($o{path}) { print "$file\n"; return 0 }
+    fail("nincs meg a logfajl: $file (indítsd el a naplózást a `tmxh --create` paranccsal)", 3) unless -f $file;
+    $o{n} = 40 unless defined $o{n};
+    fail("A sorszám nem lehet negatív.") if $o{n} < 0;
+    if (open my $fh, '<', $file) {
+        binmode $fh;
+        my @l;
+        while (my $x = <$fh>) { push @l, $x; shift @l while @l > $o{n} }
+        close $fh;
+        print @l;
+    }
+    if ($o{f}) {
+        my $pos = fsize($file);
+        my $inode = (stat($file))[1];
+        local $SIG{INT} = sub { exit 0 };
+        err('[tmxh] kovetes: Ctrl-C-ig') unless $CFG{quiet};
+        while (1) {
+            my @stat = stat($file);
+            if (@stat) {
+                $pos = 0 if $inode != $stat[1] || $pos > $stat[7];
+                $inode = $stat[1];
+                print read_range($file, $pos, $stat[7], 1) if $stat[7] > $pos;
+                $pos = $stat[7];
+            }
+            usleep(($CFG{poll} || 0.1) * 1_000_000);
+        }
+    }
+    return 0;
+}
+
+sub cmd_clean_jobs {
+    my ($argv) = @_;
+    my %o;
+    GetOptionsFromArray($argv, common_opts(), 'older=f' => \$o{older}, 'logs' => \$o{logs}, 'all' => \$o{all})
+        or fail("hasznalat: tmxh clean-jobs [--older ORA] [--logs] [--all]", 2);
+    init_paths();
+    return 0 unless -d $P{jobs};
+    $o{older} = 24 unless defined $o{older};
+    my ($rm, $keep) = (0, 0);
+    for my $j (all_jobs()) {
+        reap_job($j);
+        if (($j->{status} // '') eq 'running') { $keep++; next }
+        my $age = (time() - ($j->{finished} // $j->{started} // time())) / 3600;
+        if ($o{all} || $age > $o{older}) { unlink job_file($j->{id}); $rm++ } else { $keep++ }
+    }
+    if ($o{logs}) { for my $f ($P{tx}, $P{audit}) { rename $f, "$f.1" if fsize($f) > 1024 * 1024 } }
+    err(sprintf('[tmxh] torolt feladatok: %d, megtartva: %d', $rm, $keep)) unless $CFG{quiet};
+    return 0;
+}
+
+# A nyilvántartás a helyi fiókokhoz tartozó home könyvtárakat használja.
+sub accounts {
+    my @accounts;
+    for my $line (split /\n/, slurp('/etc/passwd') // '') {
+        my ($user, undef, $uid, undef, undef, $home) = split /:/, $line;
+        next unless defined $home && $home =~ m{^/} && $uid =~ /^\d+$/;
+        push @accounts, { user => $user, uid => $uid + 0, home => $home };
+    }
+    return @accounts;
+}
+
+sub home_path {
+    my ($path, $home) = @_;
+    $path =~ s{^~(?=/|$)}{$home};
+    return $path =~ m{^/} ? $path : "$home/$path";
+}
+
+sub valid_session {
+    my ($name) = @_;
+    return defined $name && $name =~ /\A[A-Za-z0-9_+-]+\z/;
+}
+
+sub account_config {
+    my ($account) = @_;
+    return { %$account, base => $CFG{state_dir}, default => $CFG{session_name} } if $account->{uid} == $<;
+    local %CFG = (config => "$account->{home}/tmux/config", state_dir => 'tmux', session_name => 'codex');
+    load_config_file();
+    return { %$account, base => home_path($CFG{state_dir}, $account->{home}), default => $CFG{session_name} };
+}
+
+sub selected_accounts {
+    my ($user) = @_;
+    $user //= $CFG{owner};
+    my @accounts = grep { $user eq '*' || $_->{user} eq $user } accounts();
+    fail("Ismeretlen felhasználó: $user.", 3) unless @accounts;
+    return map { account_config($_) } @accounts;
+}
+
+sub session_label {
+    my ($id, $user) = @_;
+    $id =~ s/\A\Q$user\E-//;
+    return $id;
+}
+
+sub registered_archive {
+    my ($base, $label, $id) = @_;
+    my $link = "$base/sessions/$label";
+    my $target = readlink($link);
+    return unless defined $target;
+    $target =~ s{^\.\./archive/}{$base/archive/};
+    return $target if $target =~ m{\A\Q$base\E/archive/\Q$id\E\.\d{8}-\d{6}\z};
+    return;
+}
+
+sub last_archive {
+    my ($base, $id) = @_;
+    opendir my $dir, "$base/archive" or return;
+    my @archives = sort grep { /\A\Q$id\E\.\d{8}-\d{6}\z/ && -d "$base/archive/$_" && !-l "$base/archive/$_" } readdir $dir;
+    closedir $dir;
+    return @archives ? "$base/archive/$archives[-1]" : undef;
+}
+
+sub remove_archive_link {
+    my ($link, $expected) = @_;
+    return 0 unless (readlink($link) // '') eq $expected;
+    my $base = dirname(dirname($link));
+    open my $lock, '>>', "$base/archive/.register.lock" or return 0;
+    flock($lock, LOCK_EX) or return 0;
+    return 0 unless (readlink($link) // '') eq $expected;
+    return unlink($link) ? 1 : 0;
+}
+
+sub close_hook {
+    my ($id, $link, $archive) = @_;
+    my ($rc, $index) = tmux('display-message', '-p', '-t', "$id:", '#{session_id}');
+    fail("Nem azonosítható a tmux munkamenet: $id.") if $rc || $index !~ /^\$(\d+)\s*$/;
+    my $slot = 100000 + $1;
+    my $command = join ' ', map { sq($_) } ($^X, abs_path($0), '_close-link', $link, $archive);
+    $command =~ s/#/##/g;
+    $command = 'if [ "#{==:#{hook_session_name},' . $id . '}" = 1 ]; then ' . $command . '; fi';
+    $command =~ s/([\\"\$])/\\$1/g;
+    my ($hook_rc, $message) = tmux('set-hook', '-g', "session-closed[$slot]", 'run-shell "' . $command . '"');
+    fail("Nem telepíthető a munkamenet lezárási hookja: " . trim($message)) if $hook_rc;
+}
+
+sub register_session {
+    my $id = $CFG{session};
+    my $base = $CFG{state_dir};
+    my $label = session_label($id, $CFG{owner});
+    my $link = "$base/sessions/$label";
+    make_path("$base/archive", "$base/sessions");
+    open my $lock, '>>', "$base/archive/.register.lock" or fail("Nem nyitható meg a nyilvántartási zár: $!");
+    flock($lock, LOCK_EX) or fail("Nem zárolható a nyilvántartás: $!");
+    my ($rc, $active) = tmux('show-options', '-qv', '-t', $id, '@tmxh_archive');
+    $active = trim($active);
+    my $archive = registered_archive($base, $label, $id);
+    if (!$rc && defined $archive && $active eq $archive && -d $archive && !-l $archive) {
+        return $archive;
+    }
+    if (defined(readlink($link)) && !defined $archive) {
+        fail("A munkamenet linkje másik célhoz tartozik: $link.");
+    }
+    fail("A munkamenet útvonalán már létezik egy fájl: $link.") if -e $link && !-l $link;
+    my $now = int(time());
+    do {
+        $archive = "$base/archive/$id." . strftime('%Y%m%d-%H%M%S', localtime($now++));
+    } while -e $archive || -l $archive;
+    mkdir $archive or fail("Nem hozható létre az archívum: $archive: $!");
+    my $temp = "$link.tmp.$$";
+    symlink($archive, $temp) or fail("Nem hozható létre a munkamenet linkje: $!");
+    unless (rename($temp, $link)) {
+        my $error = $!;
+        unlink($temp);
+        fail("Nem frissíthető a munkamenet linkje: $error");
+    }
+    my ($set_rc, $message) = tmux('set-option', '-t', $id, '@tmxh_archive', $archive);
+    fail("Nem menthető az archívum a tmux munkamenethez: " . trim($message)) if $set_rc;
+    close_hook($id, $link, $archive);
+    return $archive;
+}
+
+sub account_tmux {
+    my ($account, @args) = @_;
+    return tmux(@args) if $account->{uid} == $<;
+    return tmux('-S', "/tmp/tmux-$account->{uid}/default", @args);
+}
+
+sub live_sessions {
+    my ($account) = @_;
+    my ($rc, $output) = account_tmux($account, 'list-sessions', '-F', '#{session_name}|#{session_activity}');
+    return ({}, $output !~ /(?:no server running|failed to connect to server: No such file|error connecting to .*\(No such file or directory\)|Connection refused)/i) if $rc;
+    my %live;
+    for my $line (split /\n/, $output) {
+        my ($id, $changed) = split /\|/, $line, 2;
+        $live{$id} = $changed // 0 if valid_session($id);
+    }
+    return (\%live, 0);
+}
+
+sub session_rows {
+    my ($account, $all, $include_unregistered) = @_;
+    my ($live, $unknown) = live_sessions($account);
+    my ($user, $base) = @$account{qw(user base)};
+    my %rows;
+    if (opendir my $dir, "$base/sessions") {
+        for my $label (grep { valid_session($_) } readdir $dir) {
+            my $link = "$base/sessions/$label";
+            my $target = readlink($link);
+            next unless defined $target;
+            my ($id) = basename($target) =~ /\A([A-Za-z0-9_+-]+)\.\d{8}-\d{6}\z/;
+            next unless defined $id && session_label($id, $user) eq $label;
+            my $archive = registered_archive($base, $label, $id);
+            next unless defined $archive;
+            next unless $all || exists $live->{$id};
+            my $time = $live->{$id} // 0;
+            for my $path ($archive, "$archive/meta.json", "$archive/audit.log") {
+                my $modified = (stat($path))[9] // 0;
+                $time = $modified if $modified > $time;
+            }
+            $rows{$id} = { sessionid => $id, user => $user, updated => $time,
+                status => exists $live->{$id} ? 'running' : $unknown ? 'unknown' : 'stopped',
+                link => $link, target => $target, archive => $archive };
+        }
+        closedir $dir;
+    }
+    if ($include_unregistered) {
+        for my $id (keys %$live) {
+            next unless index($id, "$user-") == 0;
+            $rows{$id} //= { sessionid => $id, user => $user, updated => $live->{$id}, status => 'running' };
+        }
+    }
+    return (\%rows, $unknown);
+}
+
+sub cmd_list_sessions {
+    my ($argv) = @_;
+    my $all;
+    $_ = '--all' for grep { $_ eq '-all' } @$argv;
+    GetOptionsFromArray($argv, common_opts(), 'all' => \$all) && !@$argv or fail("Használat: tmxh list [--user NÉV|*] [--all]");
+    my @rows;
+    my $failed = 0;
+    for my $account (selected_accounts($CFG{user})) {
+        my ($rows, $unknown) = session_rows($account, $all, !$all);
+        if (($unknown || ($account->{uid} != $< && !-x $account->{home})) && ($CFG{user} // '') ne '*') {
+            err("Nem kérdezhető le a tmux szerver. Felhasználó: $account->{user}.");
+            $failed = 1;
+        }
+        push @rows, map { $rows->{$_} } sort keys %$rows;
+    }
+    if ($CFG{json}) {
+        my @summary = map {
+            +{ sessionid => $_->{sessionid}, user => $_->{user}, updated => $_->{updated}, status => $_->{status} }
+        } @rows;
+        print $JSON->encode({ sessions => \@summary }) . "\n";
+    } else {
+        printf "%-28s %-16s %-20s %s\n", 'SESSIONID', 'USER', 'UTOLSÓ FRISSÍTÉS', 'ÁLLAPOT';
+        my %labels = (running => 'fut', stopped => 'leállt', unknown => 'ismeretlen');
+        printf "%-28s %-16s %-20s %s\n", $_->{sessionid}, $_->{user}, ts_fmt($_->{updated}), $labels{$_->{status}} for @rows;
+    }
+    return $failed;
+}
+
+sub run_as_account {
+    my ($account, $action) = @_;
+    fail("Más felhasználó módosításához rendszergazdai jogosultság szükséges.") if $>;
+    my @args = ($^X, abs_path($0), $action);
+    push @args, '--session-id', $CFG{explicit_id} if defined $CFG{explicit_id};
+    push @args, '--session-name', $CFG{explicit_name} if defined $CFG{explicit_name};
+    local %ENV = %ENV;
+    delete @ENV{grep { /^TMUXH_/ || $_ eq 'TMUX' } keys %ENV};
+    return system('runuser', '-u', $account->{user}, '--', @args) == 0 ? 0 : 1;
+}
+
+sub manage_sessions {
+    my ($action) = @_;
+    my $failed = 0;
+    for my $account (selected_accounts($CFG{user})) {
+        if ($account->{uid} != $<) {
+            next if ($CFG{user} // '') eq '*' && !-d "$account->{base}/sessions";
+            if ($>) {
+                err("Nincs jogosultság más felhasználó módosítására: $account->{user}.");
+                $failed = 1;
+                next;
+            }
+            $failed |= run_as_account($account, $action);
+            next;
+        }
+        my ($rows, $unknown) = session_rows($account, 1, 0);
+        if ($unknown) {
+            err("Nem ellenőrizhető a tmux szerver. A nyilvántartás érintetlen.");
+            $failed = 1;
+            next;
+        }
+        my $name = $CFG{explicit_name} // ($action eq 'kill' && !defined $CFG{explicit_id} ? $account->{default} : undef);
+        my $id = $CFG{explicit_id} // (defined $name ? "$account->{user}-$name" : undef);
+        for my $row (sort { $a->{sessionid} cmp $b->{sessionid} } values %$rows) {
+            next if defined $id && $row->{sessionid} ne $id;
+            if ($action eq 'clean') {
+                next if $row->{status} ne 'stopped' || session_id_alive($row->{sessionid});
+            } else {
+                next if $row->{status} ne 'running';
+                local $P{audit} = "$row->{archive}/audit.log";
+                log_audit("KILL session=$row->{sessionid}");
+                my ($rc, $message) = tmux('kill-session', '-t', "=$row->{sessionid}");
+                if ($rc) {
+                    log_audit("KILL_FAILED session=$row->{sessionid}");
+                    err("Nem zárható be a munkamenet: " . trim($message));
+                    $failed = 1;
+                    next;
+                }
+            }
+            my $removed = remove_archive_link($row->{link}, $row->{target});
+            if (!$removed && (readlink($row->{link}) // '') eq $row->{target}) {
+                err("Nem törölhető a lezárt munkamenet linkje: $row->{link}.");
+                $failed = 1;
+                next;
+            }
+            err("$action: $row->{sessionid}");
+        }
+        if ($action eq 'kill' && defined $id && !exists $rows->{$id} && ($CFG{user} // '') ne '*') {
+            err("Nincs regisztrált munkamenet: $id.");
+            $failed = 1;
+        }
+    }
+    return $failed;
+}
+
+sub cmd_all_tmux_kill {
+    my ($argv) = @_;
+    GetOptionsFromArray($argv, common_opts()) && !@$argv or fail("Használat: tmxh --all-tmux-kill [--user NÉV|*]");
+    my $target = $CFG{user} // $CFG{owner};
+    my %uids = map { $_->{uid} => $_->{user} } grep { $target eq '*' || $_->{user} eq $target } accounts();
+    fail("Ismeretlen felhasználó: $target.", 3) unless %uids;
+    fail("Más felhasználó folyamataihoz rendszergazdai jogosultság szükséges.") if $> && $target ne $CFG{owner};
+    my @pids;
+    for my $path (glob '/proc/[0-9]*') {
+        my $status = slurp("$path/status") // '';
+        my ($uid) = $status =~ /^Uid:\s+(\d+)/m;
+        next unless defined $uid && exists $uids{$uid};
+        my $name = trim(slurp("$path/comm"));
+        next unless $name =~ /\Atmux(?:: (?:server|client))?\z/;
+        my $exe = readlink("$path/exe");
+        # Régebbi Linux-környezetben az exe elérése korlátozott lehet.
+        next unless defined $exe && basename($exe) =~ /\Atmux(?: \(deleted\))?\z/;
+        push @pids, 0 + basename($path);
+    }
+    my $stopped = kill 'KILL', @pids;
+    err("Leállított tmux folyamatok: $stopped.");
+    return $stopped == @pids ? 0 : 1;
+}
+
+sub cmd_clean {
+    my ($argv) = @_;
+    GetOptionsFromArray($argv, common_opts()) && !@$argv or fail("Használat: tmxh clean [--user NÉV|*] [--session-name NÉV | --session-id ID]");
+    return manage_sessions('clean');
+}
+
+sub cmd_kill {
+    my ($argv) = @_;
+    my $compat;
+    GetOptionsFromArray($argv, common_opts(), 'force' => \$compat) && !@$argv
+        or fail("Használat: tmxh kill [--user NÉV|*] [--session-name NÉV | --session-id ID]");
+    return manage_sessions('kill');
+}
+
+sub cmd_attach {
+    my ($argv) = @_;
+    GetOptionsFromArray($argv, common_opts()) or fail("hasznalat: tmxh attach", 2);
+    init_paths();
+    ensure_all();
+    my $action = $ENV{TMUX} ? 'switch-client' : 'attach-session';
+    exec($TMUX, $action, '-t', '='.$CFG{session}) or fail("A tmux nem indítható: $!");
+}
+
+sub cmd_version { print "tmxh $VERSION\n"; return 0 }
+
+#===============================================================================
+# Súgó és parancsok indítása
+#===============================================================================
+sub usage_text {
+    return <<'USAGE_TXT';
+tmxh – interaktív tmux panel vezérlése és naplózása
+
+Használat
+  tmxh [kapcsolók] parancs [parancskapcsolók] [argumentumok]
+  tmxh                  Csatlakozás a FELHASZNÁLÓ-codex munkamenethez.
+  tmxh --create         Létrehozás vagy előkészítés csatlakozás nélkül.
+  tmxh --expect-cmd ssh run --timeout 30 'hostname; pwd'
+  tmxh bg 'sleep 5; echo kész'
+  tmxh status J2 --json
+  tmxh read J2
+  tmxh wait J2 --timeout 30
+
+Parancsok
+  ensure, info           Cél és naplózás előkészítése, illetve állapotlekérdezés.
+  doctor [--no-probe]    Állapotvizsgálat. A --no-probe kihagyja a shellpróbát.
+  run [--timeout S]      Blokkoló futtatás élő terminálkimenettel és kilépési kóddal.
+      -n / --no-block    Aszinkron futtatás.
+      --subshell        Futtatás alhéjban.
+      --cwd DIR         Futtatás a megadott könyvtárban, alhéjban.
+      --eval            Futtatás here-dokumentumból betöltött shellszöveggel.
+      --env K=V         Exportálás a futtatás előtt; ismételhető.
+      --output F        A gyűjtött kimenet mentése helyi fájlba.
+  bg                     A run -n megfelelője.
+  status [JOB]           Állapot vagy feladatlista.
+  read JOB               Új kimenet. --all, --raw, --tail N, --no-advance.
+  wait [JOB|--all]       Várakozás a feladat befejeződésére.
+  send [--enter] SZÖVEG  Szöveg küldése a panelnek.
+  keys BILLENTYŰ ...     tmux billentyűk küldése.
+  interrupt [--clear]    Ctrl+C, kérésre Ctrl+U is.
+  capture [-S N]         Képernyő és előzmények lekérése.
+  tail [--for S]         A panelkimenet követése.
+  idle [--for S]         Várakozás kimeneti csendre.
+  push HELYI [CÉL]       Fájlmásolás a panelre. --verify size|md5|none.
+  log [audit|tx|rx]      Napló megtekintése. -n N, -f, --path.
+  list [--all|-all]      Munkamenetek listázása. Szűrés: --user NÉV vagy '*'.
+  clean                  Leállt munkamenetek linkjeinek törlése.
+  clean-jobs [--all]     Lezárt feladatmetaadatok törlése.
+  attach                 Csatlakozás a munkamenethez.
+  kill                   A célmunkamenet és kapcsolatai bezárása.
+  --all-tmux-kill        A kiválasztott felhasználó tmux folyamatainak leállítása.
+  version, help          Verzió és súgó.
+
+Közös kapcsolók
+  -t, --target CÉL       Munkamenet, munkamenet:ablak.panel vagy %panelazonosító.
+  -s, --session-name NÉV Logikai munkamenetnév (alapérték: codex).
+  --session-id ID        A tényleges tmux munkamenetnév előtag hozzáadása nélkül.
+  -u, --user NÉV         Fiók kiválasztása listázáshoz és kezeléshez.
+  -w, --window INDEX     Ablakindex.
+  -p, --pane PANEL      Panelindex vagy %panelazonosító a munkameneten belül.
+  --create               Létrehozás engedélyezése; önállóan csatlakozás nélkül.
+  --no-create            Meglévő munkamenet megkövetelése, csatlakozáskor is.
+  --expect-cmd ssh       Az SSH előtérfolyamat ellenőrzése bemenetküldés előtt.
+  --state-dir DIR        Az állapotkönyvtár gyökere. Alapérték: ~/tmux.
+  --config FÁJL          Konfigurációs fájl. Alapérték: ~/tmux/config.
+  --timeout S            A várakozás határa másodpercben; 0 esetén korlátlan.
+  --idle S               A kimeneti csend határa másodpercben.
+  --guard S              Panel-ellenőrzési időköz; 0 esetén kikapcsolva.
+  --json                 Gépi kimenet az ezt támogató parancsoknál.
+  --quiet, --verbose     Kevesebb állapotüzenet vagy részletes hibakeresés.
+
+Leírás: readme.md, tmux-agent.md és tmux-project.md.
+
+USAGE_TXT
+}
+
+sub cmd_help { cmd_version(); print usage_text(); return 0 }
+
+my %CMD = (
+    ensure    => \&cmd_ensure,
+    info      => \&cmd_info,
+    doctor    => \&cmd_doctor,
+    run       => \&cmd_run,
+    bg        => sub { return cmd_run($_[0], 1) },
+    status    => \&cmd_status,
+    jobs      => \&cmd_status,
+    read      => \&cmd_read,
+    wait      => \&cmd_wait,
+    tail      => \&cmd_tail,
+    idle      => \&cmd_idle,
+    capture   => \&cmd_capture,
+    send      => \&cmd_send,
+    keys      => \&cmd_keys,
+    key       => \&cmd_keys,
+    interrupt => \&cmd_interrupt,
+    push      => \&cmd_push,
+    log       => \&cmd_log,
+    logs      => \&cmd_log,
+    clean     => \&cmd_clean,
+    'clean-jobs' => \&cmd_clean_jobs,
+    list      => \&cmd_list_sessions,
+    sessions  => \&cmd_list_sessions,
+    '--all-tmux-kill' => \&cmd_all_tmux_kill,
+    kill      => \&cmd_kill,
+    attach    => \&cmd_attach,
+    version   => \&cmd_version,
+    help      => \&cmd_help,
+);
+
+sub main {
+    if (@ARGV == 3 && $ARGV[0] eq '_close-link') {
+        remove_archive_link($ARGV[1], $ARGV[2]);
+        return 0;
+    }
+    cfg_defaults();
+    my @config_args = @ARGV;
+    GetOptionsFromArray(\@config_args, 'config=s' => \$CFG{config}) or return 2;
+    load_config_file();
+    $CFG{verbose} = 1 if $ENV{TMUXH_DEBUG};
+    my @argv = @ARGV;
+    GetOptionsFromArray(\@argv, common_opts()) or do { print STDERR usage_text(); return 2 };
+    my $name = shift @argv;
+    if (!defined $name) {
+        $name = $CFG{create_requested} ? 'ensure' : 'attach';
+        $CFG{create} //= 1;
+    }
+    $name = 'help'    if $name =~ /^(?:-h|--help|help)$/;
+    $name = 'version' if $name =~ /^(?:-V|--version|version)$/;
+    my $h = $CMD{$name};
+    if (!$h) {
+        print STDERR "[tmxh HIBA] ismeretlen parancs: '$name'\n\n";
+        print STDERR usage_text();
+        return 2;
+    }
+    if ($name !~ /\A(?:list|sessions|clean|kill|--all-tmux-kill|help|version)\z/) {
+        fail("A --user a list, clean, kill és --all-tmux-kill műveletekhez használható.")
+            if defined $CFG{user} && $CFG{user} ne $CFG{owner};
+    }
+    for my $key (qw(explicit_name explicit_id session_name)) {
+        fail("Érvénytelen munkamenetnév: $CFG{$key}.") if defined $CFG{$key} && !valid_session($CFG{$key});
+    }
+    $CFG{state_dir} = home_path($CFG{state_dir}, $CFG{home});
+    $CFG{session} = $CFG{explicit_id} // "$CFG{owner}-" . ($CFG{explicit_name} // $CFG{session_name});
+    init_paths() unless $name =~ /\A(?:list|sessions|clean|kill|--all-tmux-kill|help|version)\z/;
+    resolve_pane() if $CFG{global_pane} && $name =~ /\A(?:status|jobs|read|wait|clean|log)\z/;
+    my $rc = eval { $h->(\@argv) };
+    if ($@) {
+        my $e = $@;
+        chomp $e;
+        print STDERR "[tmxh HIBA] $e\n";
+        return 2;
+    }
+    return ref $rc ? 0 : ($rc // 0);
+}
+
+exit main();
+
+__END__
+
+=encoding utf8
+
+=head1 NÉV
+
+tmxh – interaktív tmux panel vezérlése és naplózása
+
+=head1 HASZNÁLAT
+
+  tmxh
+  tmxh --create
+  tmxh run --timeout 30 'pwd; hostname'
+  tmxh bg 'sleep 5; printf "kész\n"'
+  tmxh status J1 --json
+  tmxh read J1
+  tmxh wait J1 --timeout 30
+
+=head1 MŰKÖDÉS
+
+A C<tmxh> alapértelmezés szerint a C<FELHASZNÁLÓ-codex> munkamenet aktív paneljét
+használja. Parancs nélkül csatlakozik, szükség esetén előbb helyi shellt
+indít. A C<tmxh --create> előkészíti a munkamenetet és visszaadja a
+vezérlést. A C<run> és a többi névvel megadott művelet alapból meglévő
+munkamenetet használ. Másik célhoz add meg a
+C<-t munkamenet:ablak.panel> kapcsolót.
+
+A C<run> vár, amíg megérkezik a shell által kiírt zárójelző. Alapértelmezés
+szerint futás közben továbbítja a panel kimenetét, majd átadja a parancs
+kilépési kódját. A C<bg> és a C<run -n> feladatazonosítót ad. A C<status>
+állapotot kér le, a C<read> az utolsó olvasás óta naplózott kimenetet adja
+vissza, a C<wait> a befejezésre vár.
+
+SSH mögötti munkához válaszd ki az élő panelt, és add meg a
+C<--expect-cmd ssh> kapcsolót a bemenetet küldő parancsokhoz. Az elvárt folyamat ellenőrzése
+a bemenet küldése előtt történik. A futó feladat várakozás közben is
+ellenőrzi a panelt. Megszakadás után a kapcsolatot az operátornak kell
+helyreállítania.
+
+=head1 MUNKAMENETEK ÉS ARCHÍVUMOK
+
+A helper alapkonfigurációja a C<~/tmux/config>. A C<state_dir> az
+adatkönyvtárat, a C<session_name> a logikai alapnevet adja meg. A
+munkamenet adatai az C<archive/ID.ÉÉÉÉHHNN-ÓÓPPMM> könyvtárban maradnak.
+A C<sessions/NÉV> link rendes bezáráskor eltűnik.
+
+A C<--session-name NÉV> a fióknévvel előtagolt ID-t képez. A
+C<--session-id ID> a tmux tényleges nevét választja ki. A C<list>
+alapértelmezésben a saját futó munkameneteket mutatja. A
+C<list --all --user '*'> minden elérhető fiók regisztrált munkameneteit
+listázza. A C<clean> eltávolítja a leállt munkamenetek linkjeit,
+a C<kill> lezárja és naplózza a kiválasztott munkamenetet. A
+C<--all-tmux-kill> a Linux folyamatlistája alapján állítja le a tmuxot,
+a nyilvántartás linkjei megmaradnak.
+
+=head1 NAPLÓK
+
+A panelenkénti C<rx.log> a C<pipe-pane> nyers kimenetét tárolja. Beállítása
+után a panel kézi használatának megjelenő kimenetét is rögzíti. A
+C<tx.log> a helper által küldésre előkészített szöveget és billentyűket
+tárolja, az C<audit.log> időbélyeggel rögzíti a műveleteket.
+A C<log rx --path> kiírja a kiválasztott panel naplójának útvonalát.
+
+=head1 KILÉPÉSI KÓDOK
+
+A befejeződött feladat saját kilépési kódját adja tovább. A helper
+állapotkódjai közül 2 a használati vagy működési hiba, 3 a hiányzó cél
+vagy feladat, 4 a tmux elérhetetlensége, 5 az elveszett vagy eltérő
+célpanel, 124 az időkorlát vagy csendkorlát elérése, 130 a megszakítás.
+
+=head1 TOVÁBBI DOKUMENTÁCIÓ
+
+A teljes használati útmutató a C<readme.md>, az AI-ügynöknek szóló
+útmutató a C<tmux-agent.md>, a specifikáció és a műszaki felépítés
+a C<tmux-project.md> fájlban található.
+
+=cut
