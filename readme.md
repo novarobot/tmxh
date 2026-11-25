@@ -1,5 +1,13 @@
 # tmxh - tmux helper
 
+## Install
+
+```bash
+cd /tmp && \
+wget -O tmxh.deb "$(curl -fsSL https://api.github.com/repos/novarobot/tmxh/releases/latest | python3 -c 'import json,sys; print(next(a["browser_download_url"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith(".deb")))')" && \
+apt install -y ./tmxh.deb
+```
+
 ## English
 
 First public release of tmxh on GitHub.
